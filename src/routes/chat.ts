@@ -22,80 +22,61 @@ chatRouter.post('/', async (req: Request, res: Response) => {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Accel-Buffering', 'no'); // Disable nginx buffering
+    res.setHeader('X-Accel-Buffering', 'no');
+
+    const agentId = getAgentId(company_id, role_id);
+    console.log(`Chat request for agent ${agentId}: ${message.slice(0, 100)}...`);
 
     // Send initial status
     res.write(`event: status\ndata: ${JSON.stringify({ status: 'thinking' })}\n\n`);
 
-    // TODO: Integrate with actual Moltbot gateway streaming
-    // For now, simulate a response to test the flow
+    // Call Moltbot gateway
+    const stream = await sendMessage(company_id, role_id, message, context);
     
-    const agentId = getAgentId(company_id, role_id);
-    console.log(`Chat request for agent ${agentId}: ${message.slice(0, 100)}...`);
+    const reader = stream.getReader();
+    const decoder = new TextDecoder();
+    let fullContent = '';
 
-    // Simulate tool usage (will be real events from Moltbot)
-    setTimeout(() => {
-      res.write(`event: tool_start\ndata: ${JSON.stringify({ 
-        tool: 'memory_search', 
-        query: 'relevant context' 
-      })}\n\n`);
-    }, 500);
-
-    setTimeout(() => {
-      res.write(`event: tool_end\ndata: ${JSON.stringify({ 
-        tool: 'memory_search', 
-        result_summary: 'Found 2 relevant entries' 
-      })}\n\n`);
-    }, 1000);
-
-    setTimeout(() => {
-      res.write(`event: memory_ref\ndata: ${JSON.stringify({ 
-        source: 'MEMORY.md', 
-        lines: [5, 8], 
-        snippet: 'Previous discussion about priorities...' 
-      })}\n\n`);
-    }, 1200);
-
-    // Simulate streaming response
-    const response = `I've reviewed the context and your message. Based on our previous discussions, here's my analysis...
-
-This is a placeholder response. Once the Moltbot integration is complete, you'll receive actual AI-generated responses with real tool usage and memory references.
-
-The system is working - the SSE stream is properly configured.`;
-
-    const words = response.split(' ');
-    let wordIndex = 0;
-
-    const streamInterval = setInterval(() => {
-      if (wordIndex >= words.length) {
-        clearInterval(streamInterval);
-        
+    while (true) {
+      const { done, value } = await reader.read();
+      
+      if (done) {
         // Send done event
         res.write(`event: done\ndata: ${JSON.stringify({ 
-          content: response,
-          usage: { input_tokens: 150, output_tokens: 50 }
+          content: fullContent,
+          usage: { input_tokens: 0, output_tokens: 0 }
         })}\n\n`);
-        
         res.end();
-        return;
+        break;
       }
 
-      const chunk = words[wordIndex] + ' ';
+      const chunk = decoder.decode(value, { stream: true });
+      fullContent += chunk;
+      
+      // Forward chunk as delta event
       res.write(`event: delta\ndata: ${JSON.stringify({ content: chunk })}\n\n`);
-      wordIndex++;
-    }, 50);
+    }
 
     // Handle client disconnect
     req.on('close', () => {
-      clearInterval(streamInterval);
+      reader.cancel();
     });
 
   } catch (error) {
     console.error('Chat error:', error);
-    res.write(`event: error\ndata: ${JSON.stringify({ 
-      error: 'Failed to process chat',
-      code: 'INTERNAL_ERROR'
-    })}\n\n`);
-    res.end();
+    
+    // If headers already sent, send error via SSE
+    if (res.headersSent) {
+      res.write(`event: error\ndata: ${JSON.stringify({ 
+        error: error instanceof Error ? error.message : 'Failed to process chat',
+        code: 'INTERNAL_ERROR'
+      })}\n\n`);
+      res.end();
+    } else {
+      res.status(500).json({
+        error: error instanceof Error ? error.message : 'Failed to process chat',
+        code: 'INTERNAL_ERROR'
+      });
+    }
   }
 });
