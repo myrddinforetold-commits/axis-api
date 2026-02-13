@@ -119,7 +119,7 @@ export async function getSessionStatus(
       throw new Error(`Moltbot gateway error: ${response.status}`);
     }
 
-    const data = await response.json();
+    const data = await response.json() as { updatedAt?: string; contextTokens?: number; totalTokens?: number };
     
     return {
       key: sessionKey,
@@ -181,7 +181,7 @@ export async function listCompanySessions(companyId: string): Promise<AgentSessi
       throw new Error(`Moltbot gateway error: ${response.status}`);
     }
 
-    const data = await response.json();
+    const data = await response.json() as { sessions?: Array<{ key: string; updatedAt?: string; contextTokens?: number; totalTokens?: number }> };
     const companyPrefix = `agent:axis_${companyId.slice(0, 8)}`;
     
     // Filter sessions for this company

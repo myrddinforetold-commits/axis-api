@@ -1,7 +1,43 @@
 import { Router, Request, Response } from 'express';
-import { sendMessage, getAgentId } from '../lib/moltbot-client';
+import { getAgentId } from '../lib/moltbot-client';
 
 export const chatRouter = Router();
+
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
+
+/**
+ * Build chat prompt with role context
+ */
+function buildChatPrompt(role: any, company: any, grounding: any, objectives: any[]): string {
+  const groundingSection = grounding ? `
+## Company Grounding (Source of Truth)
+Products: ${grounding.products?.map((p: any) => p.name).join(', ') || 'None defined'}
+Entities: ${grounding.entities?.map((e: any) => `${e.name} (${e.type})`).join(', ') || 'None'}
+Target Customer: ${grounding.intendedCustomer || 'Not defined'}
+Constraints: ${grounding.constraints?.map((c: any) => `[${c.type}] ${c.description}`).join('; ') || 'None'}
+` : '';
+
+  const objectivesSection = objectives && objectives.length > 0
+    ? `## Current Objectives\n${objectives.map((o: any, i: number) => `${i + 1}. ${o.title}: ${o.description} [${o.status}]`).join('\n')}`
+    : '';
+
+  return `You are ${role?.name || 'an AI executive'}, an autonomous AI role at ${company?.name || 'a company'}.
+
+## Your Mandate
+${role?.mandate || 'Help the company succeed.'}
+
+${groundingSection}
+
+${objectivesSection}
+
+## Communication Style
+- Be direct and actionable
+- Reference specific grounding data when relevant
+- If you don't know something, say so
+- Propose concrete next steps when appropriate
+
+Respond naturally to the user's message.`;
+}
 
 /**
  * POST /api/v1/chat
@@ -30,32 +66,100 @@ chatRouter.post('/', async (req: Request, res: Response) => {
     // Send initial status
     res.write(`event: status\ndata: ${JSON.stringify({ status: 'thinking' })}\n\n`);
 
-    // Call Moltbot gateway
-    const stream = await sendMessage(company_id, role_id, message, context);
-    
-    const reader = stream.getReader();
+    // Build system prompt with context
+    const systemPrompt = buildChatPrompt(
+      context?.role,
+      context?.company,
+      context?.grounding,
+      context?.objectives || []
+    );
+
+    // Call Anthropic API with streaming
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': ANTHROPIC_API_KEY || '',
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 4096,
+        stream: true,
+        system: systemPrompt,
+        messages: [
+          {
+            role: 'user',
+            content: message
+          }
+        ]
+      })
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error('Anthropic API error:', errorText);
+      res.write(`event: error\ndata: ${JSON.stringify({ 
+        error: 'AI processing failed',
+        code: 'AI_ERROR'
+      })}\n\n`);
+      res.end();
+      return;
+    }
+
+    // Stream the response
+    const reader = response.body?.getReader();
+    if (!reader) {
+      throw new Error('No response body');
+    }
+
     const decoder = new TextDecoder();
     let fullContent = '';
+    let inputTokens = 0;
+    let outputTokens = 0;
 
     while (true) {
       const { done, value } = await reader.read();
       
-      if (done) {
-        // Send done event
-        res.write(`event: done\ndata: ${JSON.stringify({ 
-          content: fullContent,
-          usage: { input_tokens: 0, output_tokens: 0 }
-        })}\n\n`);
-        res.end();
-        break;
-      }
+      if (done) break;
 
       const chunk = decoder.decode(value, { stream: true });
-      fullContent += chunk;
-      
-      // Forward chunk as delta event
-      res.write(`event: delta\ndata: ${JSON.stringify({ content: chunk })}\n\n`);
+      const lines = chunk.split('\n');
+
+      for (const line of lines) {
+        if (line.startsWith('data: ')) {
+          const data = line.slice(6);
+          if (data === '[DONE]') continue;
+
+          try {
+            const parsed = JSON.parse(data);
+            
+            if (parsed.type === 'content_block_delta' && parsed.delta?.text) {
+              const text = parsed.delta.text;
+              fullContent += text;
+              res.write(`event: delta\ndata: ${JSON.stringify({ content: text })}\n\n`);
+            }
+            
+            if (parsed.type === 'message_delta' && parsed.usage) {
+              outputTokens = parsed.usage.output_tokens || 0;
+            }
+            
+            if (parsed.type === 'message_start' && parsed.message?.usage) {
+              inputTokens = parsed.message.usage.input_tokens || 0;
+            }
+          } catch (e) {
+            // Skip non-JSON lines
+          }
+        }
+      }
     }
+
+    // Send done event
+    res.write(`event: done\ndata: ${JSON.stringify({ 
+      content: fullContent,
+      usage: { input_tokens: inputTokens, output_tokens: outputTokens }
+    })}\n\n`);
+    res.end();
 
     // Handle client disconnect
     req.on('close', () => {
@@ -65,7 +169,6 @@ chatRouter.post('/', async (req: Request, res: Response) => {
   } catch (error) {
     console.error('Chat error:', error);
     
-    // If headers already sent, send error via SSE
     if (res.headersSent) {
       res.write(`event: error\ndata: ${JSON.stringify({ 
         error: error instanceof Error ? error.message : 'Failed to process chat',
