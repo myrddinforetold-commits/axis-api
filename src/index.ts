@@ -8,6 +8,8 @@ import { autonomousRouter } from './routes/autonomous';
 import { taskRouter } from './routes/task';
 import { syncRouter } from './routes/sync';
 import { memoryRouter } from './routes/memory';
+import { provisionRouter } from './routes/provision';
+import { workspaceRouter } from './routes/workspace';
 import { authMiddleware } from './middleware/auth';
 
 dotenv.config();
@@ -33,6 +35,8 @@ app.use('/api/v1/autonomous', autonomousRouter);
 app.use('/api/v1/task', taskRouter);
 app.use('/api/v1/sync', syncRouter);
 app.use('/api/v1/memory', memoryRouter);
+app.use('/api/v1/provision', provisionRouter);
+app.use('/api/v1/workspace', workspaceRouter);
 
 // Error handler
 app.use((err: Error, req: express.Request, res: express.Response, next: express.NextFunction) => {
