@@ -1,5 +1,6 @@
 import { Request, Response, Router } from 'express';
 import { chatWithCal, CAL_TREASURY_ADDRESS } from '../lib/cal-runtime';
+import { synthesizeCalSpeech } from '../lib/cal-tts';
 import {
   CAL_CLASSIFICATION,
   CAL_IDENTITY,
@@ -77,6 +78,43 @@ calRouter.get('/metrics', async (_req: Request, res: Response) => {
     return res.status(500).json({
       error: error instanceof Error ? error.message : 'Failed to load metrics',
       code: 'INTERNAL_ERROR',
+    });
+  }
+});
+
+/**
+ * POST /api/cal/tts
+ * Body: { text, voice_id? }
+ * Response: audio/mpeg
+ */
+calRouter.post('/tts', async (req: Request, res: Response) => {
+  const { text, voice_id } = req.body as {
+    text?: string;
+    voice_id?: string;
+  };
+
+  if (!text || typeof text !== 'string') {
+    return res.status(400).json({
+      error: 'text is required',
+      code: 'INVALID_REQUEST',
+    });
+  }
+
+  try {
+    const tts = await synthesizeCalSpeech({
+      text,
+      voiceId: typeof voice_id === 'string' ? voice_id : undefined,
+    });
+
+    res.setHeader('Content-Type', tts.mimeType);
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('X-CAL-TTS-Provider', tts.provider);
+    return res.status(200).send(tts.audio);
+  } catch (error) {
+    console.error('CAL tts error:', error);
+    return res.status(502).json({
+      error: error instanceof Error ? error.message : 'Failed to synthesize speech',
+      code: 'TTS_FAILED',
     });
   }
 });
