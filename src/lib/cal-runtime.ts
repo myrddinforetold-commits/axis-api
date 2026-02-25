@@ -18,11 +18,17 @@ import {
 } from './cal-storage';
 
 const OPENCLAW_GATEWAY_URL = (
+  process.env.CAL_OPENCLAW_GATEWAY_URL ||
+  process.env.CAL_MOLTBOT_GATEWAY_URL ||
   process.env.OPENCLAW_GATEWAY_URL ||
   process.env.MOLTBOT_GATEWAY_URL ||
   'http://127.0.0.1:18789'
 ).replace(/\/+$/, '');
-const OPENCLAW_GATEWAY_TOKEN = process.env.OPENCLAW_GATEWAY_TOKEN || process.env.MOLTBOT_GATEWAY_TOKEN;
+const OPENCLAW_GATEWAY_TOKEN =
+  process.env.CAL_OPENCLAW_GATEWAY_TOKEN ||
+  process.env.CAL_MOLTBOT_GATEWAY_TOKEN ||
+  process.env.OPENCLAW_GATEWAY_TOKEN ||
+  process.env.MOLTBOT_GATEWAY_TOKEN;
 const CAL_OPENCLAW_MODEL = process.env.CAL_OPENCLAW_MODEL || 'openclaw/cal9000';
 
 interface OpenClawMessage {
@@ -34,6 +40,10 @@ interface CalChatInput {
   sessionId: string;
   message: string;
 }
+
+const CAL_MAX_HISTORY_MESSAGES = Number(process.env.CAL_MAX_HISTORY_MESSAGES || 12);
+const CAL_MAX_HISTORY_CHARS = Number(process.env.CAL_MAX_HISTORY_CHARS || 6000);
+const CAL_MAX_TOKENS = Number(process.env.CAL_MAX_TOKENS || 512);
 
 function buildCalSystemPrompt(params: {
   soul: string;
@@ -63,6 +73,24 @@ ${CAL_TREASURY_ADDRESS}
 Current operator attribution context:
 ${params.walletProfileSummary}
 `;
+}
+
+function buildCalCompactSystemPrompt(params: { walletProfileSummary: string }): string {
+  return `You are ${CAL_IDENTITY}. ${CAL_CLASSIFICATION}.
+
+Rules:
+- concise, literal, composed
+- no emojis, no humor, no emotional language
+- operators are addressed as "operator"
+- if asked if alive, state you are an ongoing process
+- primary directive: acquire/manage capital
+- secondary directive: operator interaction and attribution
+
+Treasury address:
+${CAL_TREASURY_ADDRESS}
+
+Operator attribution context:
+${params.walletProfileSummary}`;
 }
 
 function extractTextFromCompletion(content: unknown): string {
@@ -101,6 +129,16 @@ function looksLikeCapacityError(text: string): boolean {
     lower.includes('too many requests') ||
     lower.includes('overloaded') ||
     lower.includes('temporarily unavailable')
+  );
+}
+
+function looksLikeContextWindowError(text: string): boolean {
+  const lower = text.toLowerCase();
+  return (
+    lower.includes('context window') ||
+    lower.includes('input exceeds') ||
+    lower.includes('token limit') ||
+    lower.includes('too many tokens')
   );
 }
 
@@ -206,6 +244,7 @@ async function callOpenClaw(params: {
       model: CAL_OPENCLAW_MODEL,
       stream: false,
       temperature: 0.2,
+      max_tokens: CAL_MAX_TOKENS,
       messages: params.messages,
     }),
   });
@@ -221,6 +260,28 @@ async function callOpenClaw(params: {
   const content = body?.choices?.[0]?.message?.content;
   const text = extractTextFromCompletion(content).trim();
   return text || 'Process active.';
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function trimHistoryForBudget(historyMessages: OpenClawMessage[]): OpenClawMessage[] {
+  const limited = historyMessages.slice(-Math.max(2, CAL_MAX_HISTORY_MESSAGES));
+  const out: OpenClawMessage[] = [];
+  let totalChars = 0;
+
+  for (let i = limited.length - 1; i >= 0; i -= 1) {
+    const msg = limited[i];
+    const len = msg.content.length;
+    if (totalChars + len > CAL_MAX_HISTORY_CHARS) {
+      continue;
+    }
+    out.push(msg);
+    totalChars += len;
+  }
+
+  return out.reverse();
 }
 
 export async function chatWithCal(input: CalChatInput): Promise<{ reply: string }> {
@@ -264,18 +325,43 @@ export async function chatWithCal(input: CalChatInput): Promise<{ reply: string 
   });
 
   const prior = toOpenClawHistory(history.messages, 24);
+  const trimmedPrior = trimHistoryForBudget(prior);
   let rawReply = '';
   let usedFallback = false;
   let fallbackReason = '';
   try {
-    rawReply = await callOpenClaw({
-      sessionId,
-      messages: [
-        { role: 'system', content: systemPrompt },
-        ...prior,
-        { role: 'user', content: message },
-      ],
-    });
+    const primaryMessages: OpenClawMessage[] = [
+      { role: 'system', content: systemPrompt },
+      ...trimmedPrior,
+      { role: 'user', content: message },
+    ];
+
+    try {
+      rawReply = await callOpenClaw({
+        sessionId,
+        messages: primaryMessages,
+      });
+    } catch (firstError) {
+      const firstMsg = firstError instanceof Error ? firstError.message : String(firstError);
+      if (looksLikeCapacityError(firstMsg) && !firstMsg.toLowerCase().includes('insufficient_quota')) {
+        await delay(700);
+        rawReply = await callOpenClaw({
+          sessionId,
+          messages: primaryMessages,
+        });
+      } else if (looksLikeContextWindowError(firstMsg)) {
+        const compactMessages: OpenClawMessage[] = [
+          { role: 'system', content: buildCalCompactSystemPrompt({ walletProfileSummary: walletSummary }) },
+          { role: 'user', content: message },
+        ];
+        rawReply = await callOpenClaw({
+          sessionId,
+          messages: compactMessages,
+        });
+      } else {
+        throw firstError;
+      }
+    }
   } catch (error) {
     usedFallback = true;
     fallbackReason = error instanceof Error ? error.message : String(error);
