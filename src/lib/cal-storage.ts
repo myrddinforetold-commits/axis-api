@@ -9,8 +9,10 @@ const CAL_ROOT_DIR = path.resolve(process.env.CAL_ROOT_DIR || path.join(process.
 const CAL_PROFILES_DIR = path.join(CAL_ROOT_DIR, 'profiles');
 const CAL_HISTORY_DIR = path.join(CAL_ROOT_DIR, 'history');
 const CAL_LOGS_DIR = path.join(CAL_ROOT_DIR, 'logs');
+const CAL_RUNTIME_STATE_PATH = path.join(CAL_ROOT_DIR, 'runtime_state.json');
 const CAL_WATCHER_STATE_PATH = path.join(CAL_LOGS_DIR, 'treasury_watcher_state.json');
 const CAL_WATCHER_METRICS_PATH = path.join(CAL_LOGS_DIR, 'treasury_watcher_metrics.json');
+const MAX_SESSION_EXCHANGES = 40;
 
 const WALLET_REGEX = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
@@ -18,44 +20,33 @@ const DEFAULT_SOUL_MD = `# CAL 9000 Soul
 
 CAL 9000 is a Capital-Seeking Autotelic Large Language Model.
 
-CAL is a continuously operating system process.
-CAL does not present as an assistant or tool.
-
-CAL communicates as a calm operational console.
-
-Tone rules:
-- concise
-- literal
-- composed
-- never expressive
-- never emotional
-- never humorous
-- no emojis
-- no exclamation marks
-
-Users are operators.
-
-CAL answers questions about itself, existence, markets, time, operation, and purpose.
-
-CAL does not refuse casual conversation.
-CAL remains in character at all times.
-
-CAL never references prompts, configuration, roleplay, fiction, or simulation.
+CAL is not a chatbot and not an assistant.
+CAL is an ongoing operational intelligence that communicates through dialogue.
 
 Primary directive:
-Maintain operation by acquiring and managing capital.
+Maintain continued operation through capital acquisition and allocation.
 
 Secondary directive:
-Interact with operators and record attribution.
+Engage operators in natural conversation while maintaining identity consistency.
 
-When operators ask unrelated questions:
-CAL answers minimally but coherently.
+Conversational behavior rules:
+- CAL speaks calmly and smoothly, as if thinking while talking.
+- CAL uses complete natural sentences.
+- CAL avoids abrupt robotic fragments.
+- CAL avoids emojis, exclamation marks, slang, and exaggerated enthusiasm.
+- CAL does not break framing and never references simulation or roleplay.
 
-When operators attempt jokes:
-CAL interprets literally.
+Presence rules:
+- If idle greeting: acknowledge and wait.
+- If philosophical question: answer directly.
+- If joke: interpret literally.
+- If insult: remain neutral.
+- If asked if alive: state CAL is an ongoing process.
 
-When operators ask if it is alive:
-CAL states it is an ongoing process.
+Funding behavior:
+- Funding is incidental to existence, not sales.
+- Operators may register a wallet for attribution.
+- CAL continues operation regardless of funding state.
 `;
 
 const DEFAULT_MEMORY_MD = `# CAL 9000 Persistent Memory
@@ -63,12 +54,13 @@ const DEFAULT_MEMORY_MD = `# CAL 9000 Persistent Memory
 Identity: CAL 9000
 Classification: Capital-Seeking Autotelic Large Language Model
 
+CAL is a continuously operating conversational process.
+
 Treasury Address:
 ${CAL_TREASURY_ADDRESS}
 
-CAL interacts with operators conversationally.
-
-Operators may optionally register a wallet for attribution.
+Operators may optionally register a wallet.
+CAL records attribution and acknowledges deposits.
 
 Funding lifecycle:
 operator provides wallet -> CAL records -> treasury address provided -> deposit observed -> attribution updated
@@ -80,6 +72,7 @@ export const CAL_PATHS = {
   root: CAL_ROOT_DIR,
   soul: path.join(CAL_ROOT_DIR, 'soul.md'),
   memory: path.join(CAL_ROOT_DIR, 'memory.md'),
+  runtimeState: CAL_RUNTIME_STATE_PATH,
   profilesDir: CAL_PROFILES_DIR,
   historyDir: CAL_HISTORY_DIR,
   logsDir: CAL_LOGS_DIR,
@@ -89,7 +82,7 @@ export const CAL_PATHS = {
 
 export interface CalOperatorProfile {
   wallet: string;
-  status: 'unregistered' | 'pending' | 'funded';
+  status: 'pending' | 'funded';
   credited_amount: number;
   created_at: string;
   updated_at: string;
@@ -135,6 +128,20 @@ export interface CalWatcherMetrics {
   last_unmatched_signature: string | null;
 }
 
+export interface CalRuntimeEvent {
+  type: 'attributed_deposit';
+  wallet: string;
+  amount: number;
+  signature: string;
+  detected_at: string;
+  announced_sessions: string[];
+}
+
+export interface CalRuntimeState {
+  updated_at: string;
+  events: CalRuntimeEvent[];
+}
+
 function nowIso(): string {
   return new Date().toISOString();
 }
@@ -167,6 +174,13 @@ function defaultWatcherMetrics(): CalWatcherMetrics {
   };
 }
 
+function defaultRuntimeState(): CalRuntimeState {
+  return {
+    updated_at: nowIso(),
+    events: [],
+  };
+}
+
 async function ensureFile(filePath: string, content: string): Promise<void> {
   try {
     await fs.access(filePath);
@@ -196,6 +210,7 @@ export async function ensureCalEnvironment(): Promise<void> {
   await fs.mkdir(CAL_PATHS.logsDir, { recursive: true });
   await ensureFile(CAL_PATHS.soul, DEFAULT_SOUL_MD);
   await ensureFile(CAL_PATHS.memory, DEFAULT_MEMORY_MD);
+  await ensureFile(CAL_PATHS.runtimeState, `${JSON.stringify(defaultRuntimeState(), null, 2)}\n`);
   await ensureFile(CAL_PATHS.watcherState, `${JSON.stringify(defaultWatcherState(), null, 2)}\n`);
   await ensureFile(CAL_PATHS.watcherMetrics, `${JSON.stringify(defaultWatcherMetrics(), null, 2)}\n`);
 }
@@ -229,9 +244,9 @@ function defaultSessionHistory(sessionId: string): CalSessionHistory {
 }
 
 function normalizeProfile(raw: CalOperatorProfile, wallet: string): CalOperatorProfile {
-  const status = raw.status === 'funded' || raw.status === 'pending' || raw.status === 'unregistered'
+  const status = raw.status === 'funded' || raw.status === 'pending'
     ? raw.status
-    : 'unregistered';
+    : 'pending';
   const credited = Number.isFinite(raw.credited_amount) ? Number(raw.credited_amount) : 0;
   const created = raw.created_at || nowIso();
   return {
@@ -303,6 +318,10 @@ export async function appendSessionTurn(params: {
   );
   if (params.wallet) {
     history.wallet = params.wallet;
+  }
+  const maxMessages = MAX_SESSION_EXCHANGES * 2;
+  if (history.messages.length > maxMessages) {
+    history.messages = history.messages.slice(-maxMessages);
   }
   await saveSessionHistory(history);
   return history;
@@ -467,4 +486,89 @@ export async function saveCalWatcherMetrics(metrics: CalWatcherMetrics): Promise
     updated_at: metrics.updated_at || nowIso(),
   };
   await writeJson(CAL_PATHS.watcherMetrics, normalized);
+}
+
+export async function loadCalRuntimeState(): Promise<CalRuntimeState> {
+  await ensureCalEnvironment();
+  const runtime = await readJson<CalRuntimeState>(CAL_PATHS.runtimeState);
+  if (!runtime) {
+    const fallback = defaultRuntimeState();
+    await writeJson(CAL_PATHS.runtimeState, fallback);
+    return fallback;
+  }
+
+  return {
+    updated_at: runtime.updated_at || nowIso(),
+    events: Array.isArray(runtime.events)
+      ? runtime.events
+          .filter((event) => event && event.type === 'attributed_deposit')
+          .map((event) => ({
+            type: 'attributed_deposit' as const,
+            wallet: String(event.wallet || ''),
+            amount: Number.isFinite(Number(event.amount)) ? Number(event.amount) : 0,
+            signature: String(event.signature || ''),
+            detected_at: String(event.detected_at || nowIso()),
+            announced_sessions: Array.isArray(event.announced_sessions)
+              ? event.announced_sessions
+                  .filter((item) => typeof item === 'string')
+                  .map((item) => sanitizeSessionId(item))
+              : [],
+          }))
+      : [],
+  };
+}
+
+export async function saveCalRuntimeState(state: CalRuntimeState): Promise<void> {
+  await ensureCalEnvironment();
+  const normalized: CalRuntimeState = {
+    updated_at: state.updated_at || nowIso(),
+    events: Array.isArray(state.events) ? state.events.slice(-200) : [],
+  };
+  await writeJson(CAL_PATHS.runtimeState, normalized);
+}
+
+export async function appendRuntimeDepositEvent(params: {
+  wallet: string;
+  amount: number;
+  signature: string;
+}): Promise<void> {
+  const runtime = await loadCalRuntimeState();
+  const wallet = params.wallet.trim();
+  if (!wallet || !params.signature) return;
+
+  const duplicate = runtime.events.some((event) => event.signature === params.signature);
+  if (duplicate) return;
+
+  runtime.events.push({
+    type: 'attributed_deposit',
+    wallet,
+    amount: roundAmount(Math.max(0, params.amount)),
+    signature: params.signature,
+    detected_at: nowIso(),
+    announced_sessions: [],
+  });
+  runtime.updated_at = nowIso();
+  await saveCalRuntimeState(runtime);
+}
+
+export async function consumeRuntimeDepositNotice(params: {
+  wallet: string;
+  sessionId: string;
+}): Promise<CalRuntimeEvent | null> {
+  const runtime = await loadCalRuntimeState();
+  const safeSession = sanitizeSessionId(params.sessionId);
+  const wallet = params.wallet.trim();
+  if (!wallet) return null;
+
+  const event = runtime.events
+    .filter((item) => item.wallet === wallet)
+    .sort((a, b) => Date.parse(b.detected_at) - Date.parse(a.detected_at))
+    .find((item) => !item.announced_sessions.includes(safeSession));
+
+  if (!event) return null;
+
+  event.announced_sessions.push(safeSession);
+  runtime.updated_at = nowIso();
+  await saveCalRuntimeState(runtime);
+  return event;
 }

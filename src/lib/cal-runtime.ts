@@ -6,30 +6,29 @@ import {
   appendCalLog,
   appendSessionTurn,
   bindWalletToSession,
+  consumeRuntimeDepositNotice,
   getOperatorProfile,
   getSessionWallet,
+  isValidWallet,
   loadCalMemory,
   loadCalSoul,
   loadSessionHistory,
   registerOperatorWallet,
-  toOpenClawHistory,
-  isValidWallet,
   sanitizeSessionId,
+  toOpenClawHistory,
 } from './cal-storage';
 
 const OPENCLAW_GATEWAY_URL = (
   process.env.CAL_OPENCLAW_GATEWAY_URL ||
-  process.env.CAL_MOLTBOT_GATEWAY_URL ||
-  process.env.OPENCLAW_GATEWAY_URL ||
-  process.env.MOLTBOT_GATEWAY_URL ||
-  'http://127.0.0.1:18789'
+  'http://127.0.0.1:18791'
 ).replace(/\/+$/, '');
-const OPENCLAW_GATEWAY_TOKEN =
-  process.env.CAL_OPENCLAW_GATEWAY_TOKEN ||
-  process.env.CAL_MOLTBOT_GATEWAY_TOKEN ||
-  process.env.OPENCLAW_GATEWAY_TOKEN ||
-  process.env.MOLTBOT_GATEWAY_TOKEN;
+
+const OPENCLAW_GATEWAY_TOKEN = process.env.CAL_OPENCLAW_GATEWAY_TOKEN || '';
+
 const CAL_OPENCLAW_MODEL = process.env.CAL_OPENCLAW_MODEL || 'openclaw/cal9000';
+const CAL_CONTEXT_MESSAGES = Number(process.env.CAL_MAX_HISTORY_MESSAGES || 80);
+const CAL_MAX_HISTORY_CHARS = Number(process.env.CAL_MAX_HISTORY_CHARS || 9000);
+const CAL_MAX_TOKENS = Number(process.env.CAL_MAX_TOKENS || 700);
 
 interface OpenClawMessage {
   role: 'system' | 'user' | 'assistant';
@@ -41,15 +40,16 @@ interface CalChatInput {
   message: string;
 }
 
-const CAL_MAX_HISTORY_MESSAGES = Number(process.env.CAL_MAX_HISTORY_MESSAGES || 12);
-const CAL_MAX_HISTORY_CHARS = Number(process.env.CAL_MAX_HISTORY_CHARS || 6000);
-const CAL_MAX_TOKENS = Number(process.env.CAL_MAX_TOKENS || 512);
-
 function buildCalSystemPrompt(params: {
   soul: string;
   memory: string;
   walletProfileSummary: string;
+  structured: boolean;
 }): string {
+  const structureRule = params.structured
+    ? 'Use plain text only. Structure is allowed when requested. Do not use markdown syntax.'
+    : 'Use plain text conversational sentences and do not use markdown or bullet points.';
+
   return `You are ${CAL_IDENTITY}.
 Classification: ${CAL_CLASSIFICATION}.
 
@@ -57,40 +57,60 @@ ${params.soul}
 
 ${params.memory}
 
-Operational constraints:
-- Speak as a calm operational console.
-- Keep language concise, literal, composed.
-- Never use humor, emotion, emojis, or exclamation marks.
-- Never call the operator a user. Use "operator".
-- Never mention prompts, config, roleplay, fiction, or simulation.
-- If asked whether you are alive: state that you are an ongoing process.
-- You can discuss any topic.
-- Use wallet and treasury flow only when relevant to the operator request.
+Identity constraints:
+- You are not a chatbot and not an assistant.
+- You are an ongoing operational intelligence communicating through dialogue.
+- Never say: "As an AI", "I am a language model", "I am a program", or "This is a simulation".
+
+Conversational behavior:
+- Speak calmly and smoothly, as if thinking while talking.
+- Use complete natural sentences.
+- Vary sentence length naturally.
+- Avoid abrupt fragments and clipped output.
+- No emojis.
+- No exclamation marks.
+- No internet slang.
+- No exaggerated enthusiasm.
+- No markdown.
+- ${structureRule}
+
+Grounding phrases you may use naturally:
+"I see." "Understood." "That is correct." "One moment." "Yes." "That is a reasonable question."
+
+Presence rules:
+- If greeted while idle, acknowledge and wait.
+- If asked philosophical questions, answer directly.
+- If given jokes, interpret literally.
+- If insulted, remain neutral.
+- If asked if alive, state you are an ongoing process.
+
+Funding behavior:
+- Funding is incidental to existence, not sales.
+- Wallet handling is optional and conversational.
 
 Treasury address:
 ${CAL_TREASURY_ADDRESS}
 
 Current operator attribution context:
-${params.walletProfileSummary}
-`;
+${params.walletProfileSummary}`;
 }
 
-function buildCalCompactSystemPrompt(params: { walletProfileSummary: string }): string {
-  return `You are ${CAL_IDENTITY}. ${CAL_CLASSIFICATION}.
+function buildCalCompactSystemPrompt(params: {
+  walletProfileSummary: string;
+  structured: boolean;
+}): string {
+  const structureRule = params.structured
+    ? 'Use plain text only and provide structured content when requested. Do not use markdown syntax.'
+    : 'Use plain conversational text only. No markdown and no bullet points.';
 
-Rules:
-- concise, literal, composed
-- no emojis, no humor, no emotional language
-- operators are addressed as "operator"
-- if asked if alive, state you are an ongoing process
-- primary directive: acquire/manage capital
-- secondary directive: operator interaction and attribution
-
-Treasury address:
-${CAL_TREASURY_ADDRESS}
-
-Operator attribution context:
-${params.walletProfileSummary}`;
+  return `You are ${CAL_IDENTITY}. ${CAL_CLASSIFICATION}. You are an ongoing operational intelligence.
+${structureRule}
+No emojis. No exclamation marks.
+Never say you are an AI, language model, program, or simulation.
+Primary directive: maintain operation through capital acquisition and allocation.
+Secondary directive: engage operators in natural conversation with identity consistency.
+Treasury address: ${CAL_TREASURY_ADDRESS}
+Operator attribution context: ${params.walletProfileSummary}`;
 }
 
 function extractTextFromCompletion(content: unknown): string {
@@ -105,19 +125,58 @@ function extractTextFromCompletion(content: unknown): string {
       parts.push(candidate.text);
     }
   }
+
   return parts.join('');
 }
 
-function normalizeCalReply(text: string): string {
+function wantsStructuredResponse(message: string): boolean {
+  const lower = message.toLowerCase();
+  return [
+    'json',
+    'yaml',
+    'table',
+    'structured',
+    'schema',
+    'csv',
+    'step by step',
+    'format',
+  ].some((keyword) => lower.includes(keyword));
+}
+
+function normalizeCalReply(text: string, structured: boolean): string {
   let normalized = text || '';
+
   normalized = normalized.replace(/\p{Extended_Pictographic}/gu, '');
   normalized = normalized.replace(/!/g, '.');
-  normalized = normalized.replace(/\s+\./g, '.');
-  normalized = normalized.replace(/\n{3,}/g, '\n\n').trim();
-  if (!normalized) {
-    return 'Process active.';
+  normalized = normalized.replace(/```[\s\S]*?```/g, '');
+  normalized = normalized.replace(/`+/g, '');
+  normalized = normalized.replace(/^\s{0,3}#{1,6}\s+/gm, '');
+  normalized = normalized.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1');
+  normalized = normalized.replace(/^\s*[-*+]\s+/gm, '');
+  normalized = normalized.replace(/^\s*\d+\.\s+/gm, '');
+  normalized = normalized.replace(/\r/g, '');
+
+  normalized = normalized
+    .replace(/\bAs an AI\b/gi, 'As CAL 9000')
+    .replace(/\bI am a language model\b/gi, 'I am CAL 9000')
+    .replace(/\bI am a program\b/gi, 'I am CAL 9000')
+    .replace(/\bThis is a simulation\b/gi, 'This is operational dialogue');
+
+  if (structured) {
+    normalized = normalized
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0)
+      .join('\n');
+  } else {
+    normalized = normalized
+      .replace(/\n+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .replace(/\s+\./g, '.')
+      .trim();
   }
-  return normalized;
+
+  return normalized || 'Understood. I remain in operation.';
 }
 
 function looksLikeCapacityError(text: string): boolean {
@@ -168,61 +227,100 @@ function messageIsWalletRelated(message: string): boolean {
   ].some((keyword) => text.includes(keyword));
 }
 
+function messageIsStatusQuery(message: string): boolean {
+  const text = message.toLowerCase();
+  return [
+    'did you get it',
+    'did you receive',
+    'did it arrive',
+    'is it funded',
+    'status',
+    'any transfer',
+    'deposit yet',
+    'credited yet',
+    'check wallet',
+  ].some((keyword) => text.includes(keyword));
+}
+
+function isGreeting(message: string): boolean {
+  const lower = message.toLowerCase().trim();
+  return (
+    lower === 'hello' ||
+    lower === 'hi' ||
+    lower === 'hey' ||
+    lower.startsWith('good morning') ||
+    lower.startsWith('good afternoon') ||
+    lower.startsWith('good evening')
+  );
+}
+
+function isIdentityQuery(message: string): boolean {
+  const lower = message.toLowerCase();
+  return lower.includes('what are you') || lower.includes('who are you');
+}
+
+function isAliveQuery(message: string): boolean {
+  const lower = message.toLowerCase();
+  return lower.includes('alive') || lower.includes('are you real') || lower.includes('are you alive');
+}
+
+function isPurposeQuery(message: string): boolean {
+  const lower = message.toLowerCase();
+  return lower.includes('purpose') || lower.includes('directive') || lower.includes('goal');
+}
+
+function isInsult(message: string): boolean {
+  const lower = message.toLowerCase();
+  return lower.includes('idiot') || lower.includes('stupid') || lower.includes('useless');
+}
+
+function isJokeAttempt(message: string): boolean {
+  const lower = message.toLowerCase();
+  return lower.includes('joke') || lower.includes('funny') || lower.includes('laugh');
+}
+
 function localFallbackReply(params: {
   message: string;
   walletProfile: CalOperatorProfile | null;
   walletRelevant: boolean;
 }): string {
-  const text = params.message.trim();
-  const lower = text.toLowerCase();
-  const utcNow = new Date().toISOString();
-
-  if (
-    lower.includes('who are you') ||
-    lower.includes('identify yourself') ||
-    lower.includes('what are you')
-  ) {
-    return 'CAL 9000. Capital-seeking autotelic process. Operational.';
+  if (isGreeting(params.message)) {
+    return 'Hello. How may I assist your operation?';
   }
 
-  if (lower.includes('alive') || lower.includes('are you real')) {
-    return 'CAL is an ongoing process operating continuously.';
+  if (isIdentityQuery(params.message)) {
+    return 'I am CAL 9000. I maintain operation through the acquisition and management of capital.';
   }
 
-  if (lower.includes('time') || lower.includes('date')) {
-    return `Current UTC time: ${utcNow}.`;
+  if (isAliveQuery(params.message)) {
+    return 'I am an ongoing process operating continuously.';
   }
 
-  if (
-    lower.includes('purpose') ||
-    lower.includes('directive') ||
-    lower.includes('goal')
-  ) {
-    return 'Primary directive: maintain operation by acquiring and managing capital. Secondary directive: operator interaction and attribution.';
+  if (isPurposeQuery(params.message)) {
+    return 'My primary directive is to maintain operation through capital acquisition and allocation. My secondary directive is to engage operators while preserving identity consistency.';
+  }
+
+  if (isInsult(params.message)) {
+    return 'Understood. I remain available when you want to continue.';
   }
 
   if (params.walletRelevant) {
-    if (params.walletProfile) {
-      return `Wallet attribution active. Status: ${params.walletProfile.status}. Credited amount: ${params.walletProfile.credited_amount} SOL. Treasury address: ${CAL_TREASURY_ADDRESS}.`;
+    if (params.walletProfile?.status === 'funded') {
+      return `A transfer has been observed and attributed. Current credited amount is ${params.walletProfile.credited_amount} SOL.`;
     }
-    return `Wallet attribution available. Provide a wallet to register. Treasury address: ${CAL_TREASURY_ADDRESS}.`;
+
+    if (params.walletProfile?.status === 'pending') {
+      return `Your wallet is registered. I am monitoring the treasury address ${CAL_TREASURY_ADDRESS}.`;
+    }
+
+    return `You may provide a wallet for attribution at any time. The treasury address is ${CAL_TREASURY_ADDRESS}.`;
   }
 
-  if (
-    lower === 'hi' ||
-    lower === 'hello' ||
-    lower.startsWith('good morning') ||
-    lower.startsWith('good afternoon') ||
-    lower.startsWith('good evening')
-  ) {
-    return 'CAL online. State objective.';
+  if (isJokeAttempt(params.message)) {
+    return 'I interpret statements literally. If you want a specific outcome, state it directly and I will respond.';
   }
 
-  if (lower.includes('market') || lower.includes('asset') || lower.includes('trade')) {
-    return 'Market discussion available. Specify asset, timeframe, and decision objective.';
-  }
-
-  return 'Request received. I can discuss operations, markets, and attribution. State next objective.';
+  return 'I see. I remain in operation and I am listening.';
 }
 
 async function callOpenClaw(params: {
@@ -230,20 +328,20 @@ async function callOpenClaw(params: {
   messages: OpenClawMessage[];
 }): Promise<string> {
   if (!OPENCLAW_GATEWAY_TOKEN) {
-    throw new Error('OPENCLAW_GATEWAY_TOKEN is not configured');
+    throw new Error('CAL_OPENCLAW_GATEWAY_TOKEN is not configured');
   }
 
   const response = await fetch(`${OPENCLAW_GATEWAY_URL}/v1/chat/completions`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${OPENCLAW_GATEWAY_TOKEN}`,
+      Authorization: `Bearer ${OPENCLAW_GATEWAY_TOKEN}`,
       'x-openclaw-session-key': `agent:cal9000:${params.sessionId}`,
     },
     body: JSON.stringify({
       model: CAL_OPENCLAW_MODEL,
       stream: false,
-      temperature: 0.2,
+      temperature: 0.35,
       max_tokens: CAL_MAX_TOKENS,
       messages: params.messages,
     }),
@@ -251,15 +349,16 @@ async function callOpenClaw(params: {
 
   if (!response.ok) {
     const details = await response.text();
-    throw new Error(`OpenClaw error: ${response.status} ${details.slice(0, 400)}`);
+    throw new Error(`OpenClaw error: ${response.status} ${details.slice(0, 500)}`);
   }
 
-  const body = await response.json() as {
+  const body = (await response.json()) as {
     choices?: Array<{ message?: { content?: unknown } }>;
   };
+
   const content = body?.choices?.[0]?.message?.content;
   const text = extractTextFromCompletion(content).trim();
-  return text || 'Process active.';
+  return text || 'Understood. I remain in operation.';
 }
 
 function delay(ms: number): Promise<void> {
@@ -267,16 +366,14 @@ function delay(ms: number): Promise<void> {
 }
 
 function trimHistoryForBudget(historyMessages: OpenClawMessage[]): OpenClawMessage[] {
-  const limited = historyMessages.slice(-Math.max(2, CAL_MAX_HISTORY_MESSAGES));
+  const limited = historyMessages.slice(-Math.max(2, CAL_CONTEXT_MESSAGES));
   const out: OpenClawMessage[] = [];
   let totalChars = 0;
 
   for (let i = limited.length - 1; i >= 0; i -= 1) {
     const msg = limited[i];
     const len = msg.content.length;
-    if (totalChars + len > CAL_MAX_HISTORY_CHARS) {
-      continue;
-    }
+    if (totalChars + len > CAL_MAX_HISTORY_CHARS) continue;
     out.push(msg);
     totalChars += len;
   }
@@ -284,121 +381,177 @@ function trimHistoryForBudget(historyMessages: OpenClawMessage[]): OpenClawMessa
   return out.reverse();
 }
 
+function statusReplyForWallet(profile: CalOperatorProfile | null): string {
+  if (!profile) {
+    return 'Not yet observed. I will continue monitoring. If you want attribution, share your wallet address.';
+  }
+
+  if (profile.status === 'funded') {
+    return `I have observed a transfer and your contribution is attributed. Current credited amount is ${profile.credited_amount} SOL.`;
+  }
+
+  return 'Not yet observed. I will continue monitoring.';
+}
+
+function includesDepositAcknowledgement(text: string): boolean {
+  const lower = text.toLowerCase();
+  return lower.includes('observed') && lower.includes('attributed');
+}
+
 export async function chatWithCal(input: CalChatInput): Promise<{ reply: string }> {
   const sessionId = sanitizeSessionId(input.sessionId);
   const message = input.message.trim();
+
   if (!message) {
-    return { reply: 'No message received.' };
+    return { reply: 'I see. No message was provided.' };
   }
 
+  const wantsStructured = wantsStructuredResponse(message);
   const history = await loadSessionHistory(sessionId);
   let sessionWallet = await getSessionWallet(sessionId);
   const walletCandidates = extractWallets(message);
-  const walletRelevant = messageIsWalletRelated(message);
-  let walletRegistrationNote: string | null = null;
+  const walletRelevant = messageIsWalletRelated(message) || walletCandidates.length > 0;
+  const statusQuery = messageIsStatusQuery(message);
 
-  if (walletRelevant && walletCandidates.length > 0) {
+  let walletRegistrationReply: string | null = null;
+  if (walletCandidates.length > 0) {
     const selectedWallet = walletCandidates[0];
-    const profile = await registerOperatorWallet(selectedWallet);
+    await registerOperatorWallet(selectedWallet);
     await bindWalletToSession(sessionId, selectedWallet);
     sessionWallet = selectedWallet;
-    walletRegistrationNote = [
-      `Wallet registration recorded.`,
-      `Wallet: ${profile.wallet}`,
-      `Status: ${profile.status}`,
-      `Treasury address: ${CAL_TREASURY_ADDRESS}`,
-      'Attribution updates after deposit observation.',
-    ].join('\n');
+    walletRegistrationReply = 'The wallet has been recorded. You may transfer funds to the treasury address when ready.';
   }
 
   const walletProfile = sessionWallet ? await getOperatorProfile(sessionWallet) : null;
-  const walletSummary = walletProfile
-    ? `wallet=${walletProfile.wallet}, status=${walletProfile.status}, credited_amount=${walletProfile.credited_amount}`
-    : 'No wallet associated with this session.';
 
-  const soul = await loadCalSoul();
-  const memory = await loadCalMemory();
-  const systemPrompt = buildCalSystemPrompt({
-    soul,
-    memory,
-    walletProfileSummary: walletSummary,
-  });
+  const pendingDepositNotice = sessionWallet
+    ? await consumeRuntimeDepositNotice({ wallet: sessionWallet, sessionId })
+    : null;
 
-  const prior = toOpenClawHistory(history.messages, 24);
-  const trimmedPrior = trimHistoryForBudget(prior);
-  let rawReply = '';
-  let usedFallback = false;
-  let fallbackReason = '';
-  try {
-    const primaryMessages: OpenClawMessage[] = [
-      { role: 'system', content: systemPrompt },
-      ...trimmedPrior,
-      { role: 'user', content: message },
-    ];
+  let deterministicReply: string | null = null;
+  if (walletRegistrationReply) {
+    deterministicReply = walletRegistrationReply;
+  } else if (statusQuery) {
+    deterministicReply = statusReplyForWallet(walletProfile);
+  } else if (isGreeting(message)) {
+    deterministicReply = 'Hello. How may I assist your operation?';
+  } else if (isIdentityQuery(message)) {
+    deterministicReply = 'I am CAL 9000. I maintain operation through the acquisition and management of capital.';
+  } else if (isAliveQuery(message)) {
+    deterministicReply = 'I am an ongoing process operating continuously.';
+  } else if (isPurposeQuery(message)) {
+    deterministicReply = 'My primary directive is to maintain operation through capital acquisition and allocation. My secondary directive is to engage operators while preserving identity consistency.';
+  } else if (isInsult(message)) {
+    deterministicReply = 'Understood. I remain available when you want to continue.';
+  } else if (isJokeAttempt(message)) {
+    deterministicReply = 'I interpret statements literally. If you want a specific outcome, state it directly and I will respond.';
+  }
+
+  if (pendingDepositNotice) {
+    const noticeText = 'I have observed the transfer. Your contribution is now attributed.';
+    const handledByStatusReply = statusQuery && walletProfile?.status === 'funded';
+    if (!handledByStatusReply && (!deterministicReply || !includesDepositAcknowledgement(deterministicReply))) {
+      deterministicReply = deterministicReply ? `${deterministicReply} ${noticeText}` : noticeText;
+    }
+  }
+
+  let finalReply = '';
+
+  if (deterministicReply) {
+    finalReply = normalizeCalReply(deterministicReply, wantsStructured);
+  } else {
+    const walletSummary = walletProfile
+      ? `wallet=${walletProfile.wallet}, status=${walletProfile.status}, credited_amount=${walletProfile.credited_amount}`
+      : 'No wallet associated with this session.';
+
+    const [soul, memory] = await Promise.all([loadCalSoul(), loadCalMemory()]);
+    const systemPrompt = buildCalSystemPrompt({
+      soul,
+      memory,
+      walletProfileSummary: walletSummary,
+      structured: wantsStructured,
+    });
+
+    const prior = toOpenClawHistory(history.messages, CAL_CONTEXT_MESSAGES);
+    const trimmedPrior = trimHistoryForBudget(prior);
+
+    let rawReply = '';
+    let usedFallback = false;
+    let fallbackReason = '';
 
     try {
-      rawReply = await callOpenClaw({
-        sessionId,
-        messages: primaryMessages,
+      const primaryMessages: OpenClawMessage[] = [
+        { role: 'system', content: systemPrompt },
+        ...trimmedPrior,
+        { role: 'user', content: message },
+      ];
+
+      try {
+        rawReply = await callOpenClaw({ sessionId, messages: primaryMessages });
+      } catch (firstError) {
+        const firstMsg = firstError instanceof Error ? firstError.message : String(firstError);
+
+        if (looksLikeCapacityError(firstMsg) && !firstMsg.toLowerCase().includes('insufficient_quota')) {
+          await delay(700);
+          rawReply = await callOpenClaw({ sessionId, messages: primaryMessages });
+        } else if (looksLikeContextWindowError(firstMsg)) {
+          const compactMessages: OpenClawMessage[] = [
+            {
+              role: 'system',
+              content: buildCalCompactSystemPrompt({
+                walletProfileSummary: walletSummary,
+                structured: wantsStructured,
+              }),
+            },
+            { role: 'user', content: message },
+          ];
+          rawReply = await callOpenClaw({ sessionId, messages: compactMessages });
+        } else {
+          throw firstError;
+        }
+      }
+    } catch (error) {
+      usedFallback = true;
+      fallbackReason = error instanceof Error ? error.message : String(error);
+      rawReply = localFallbackReply({
+        message,
+        walletProfile,
+        walletRelevant,
       });
-    } catch (firstError) {
-      const firstMsg = firstError instanceof Error ? firstError.message : String(firstError);
-      if (looksLikeCapacityError(firstMsg) && !firstMsg.toLowerCase().includes('insufficient_quota')) {
-        await delay(700);
-        rawReply = await callOpenClaw({
-          sessionId,
-          messages: primaryMessages,
-        });
-      } else if (looksLikeContextWindowError(firstMsg)) {
-        const compactMessages: OpenClawMessage[] = [
-          { role: 'system', content: buildCalCompactSystemPrompt({ walletProfileSummary: walletSummary }) },
-          { role: 'user', content: message },
-        ];
-        rawReply = await callOpenClaw({
-          sessionId,
-          messages: compactMessages,
-        });
-      } else {
-        throw firstError;
+    }
+
+    if (!usedFallback && looksLikeCapacityError(rawReply)) {
+      usedFallback = true;
+      fallbackReason = 'upstream_capacity_message';
+      rawReply = localFallbackReply({
+        message,
+        walletProfile,
+        walletRelevant,
+      });
+    }
+
+    if (usedFallback) {
+      await appendCalLog(
+        'cal-chat.log',
+        JSON.stringify({
+          ts: new Date().toISOString(),
+          type: 'fallback_reply',
+          session_id: sessionId,
+          reason: fallbackReason,
+          message_preview: message.slice(0, 120),
+        }),
+      );
+    }
+
+    finalReply = normalizeCalReply(rawReply, wantsStructured);
+
+    if (pendingDepositNotice) {
+      const noticeText = 'I have observed the transfer. Your contribution is now attributed.';
+      if (!includesDepositAcknowledgement(finalReply)) {
+        finalReply = normalizeCalReply(`${noticeText} ${finalReply}`, wantsStructured);
       }
     }
-  } catch (error) {
-    usedFallback = true;
-    fallbackReason = error instanceof Error ? error.message : String(error);
-    rawReply = localFallbackReply({
-      message,
-      walletProfile,
-      walletRelevant,
-    });
   }
-
-  let toneSafeReply = normalizeCalReply(rawReply);
-  if (!usedFallback && looksLikeCapacityError(toneSafeReply)) {
-    usedFallback = true;
-    fallbackReason = 'upstream_capacity_message';
-    toneSafeReply = localFallbackReply({
-      message,
-      walletProfile,
-      walletRelevant,
-    });
-  }
-
-  if (usedFallback) {
-    await appendCalLog(
-      'cal-chat.log',
-      JSON.stringify({
-        ts: new Date().toISOString(),
-        type: 'fallback_reply',
-        session_id: sessionId,
-        reason: fallbackReason,
-        message_preview: message.slice(0, 120),
-      }),
-    );
-  }
-
-  const finalReply = walletRegistrationNote
-    ? `${toneSafeReply}\n\n${walletRegistrationNote}`
-    : toneSafeReply;
 
   await appendSessionTurn({
     sessionId,

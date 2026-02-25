@@ -220,7 +220,8 @@ calRouter.get('/status', async (req: Request, res: Response) => {
     if (!profile) {
       return res.json({
         wallet,
-        status: 'unregistered',
+        status: 'pending',
+        registered: false,
         credited_amount: 0,
         treasury_address: CAL_TREASURY_ADDRESS,
       });
@@ -229,6 +230,7 @@ calRouter.get('/status', async (req: Request, res: Response) => {
     return res.json({
       wallet: profile.wallet,
       status: profile.status,
+      registered: true,
       credited_amount: profile.credited_amount,
       created_at: profile.created_at,
       updated_at: profile.updated_at,

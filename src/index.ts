@@ -10,7 +10,7 @@ import { syncRouter } from './routes/sync';
 import { memoryRouter } from './routes/memory';
 import { provisionRouter } from './routes/provision';
 import { workspaceRouter } from './routes/workspace';
-import { calRouter } from './routes/cal';
+import { calRouter } from './routes/cal.routes';
 import { authMiddleware } from './middleware/auth';
 
 dotenv.config();

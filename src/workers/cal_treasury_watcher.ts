@@ -1,6 +1,7 @@
 import {
   CAL_TREASURY_ADDRESS,
   CalWatcherMetrics,
+  appendRuntimeDepositEvent,
   appendCalLog,
   ensureCalEnvironment,
   getOperatorProfile,
@@ -152,6 +153,11 @@ async function pollTreasuryOnce(metrics: CalWatcherMetrics): Promise<void> {
 
       const amountSol = transfer.lamports / LAMPORTS_PER_SOL;
       const updated = await markWalletFunded(profile.wallet, amountSol);
+      await appendRuntimeDepositEvent({
+        wallet: updated.wallet,
+        amount: amountSol,
+        signature: transfer.signature,
+      });
       metrics.attributed_deposit_count += 1;
       metrics.last_attributed_signature = transfer.signature;
       await appendCalLog(

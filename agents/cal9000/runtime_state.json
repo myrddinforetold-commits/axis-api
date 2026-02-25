@@ -1,0 +1,39 @@
+{
+  "updated_at": "2026-02-25T23:29:14.159Z",
+  "events": [
+    {
+      "type": "attributed_deposit",
+      "wallet": "HvzEzaGqbMFCjxMruwfLw3RfRSbG4xuQUMtr5sxJEzev",
+      "amount": 0.25,
+      "signature": "sig-1772062040194",
+      "detected_at": "2026-02-25T23:27:20.195Z",
+      "announced_sessions": [
+        "spec-deposit-notice",
+        "spec-deposit-1772062067112"
+      ]
+    },
+    {
+      "type": "attributed_deposit",
+      "wallet": "HvzEzaGqbMFCjxMruwfLw3RfRSbG4xuQUMtr5sxJEzev",
+      "amount": 0.3,
+      "signature": "sig-1772062067119",
+      "detected_at": "2026-02-25T23:27:47.120Z",
+      "announced_sessions": [
+        "spec-deposit-1772062067112",
+        "spec-deposit-1772062135326",
+        "spec-final-1772062154149"
+      ]
+    },
+    {
+      "type": "attributed_deposit",
+      "wallet": "HvzEzaGqbMFCjxMruwfLw3RfRSbG4xuQUMtr5sxJEzev",
+      "amount": 0.1,
+      "signature": "sig-1772062135333",
+      "detected_at": "2026-02-25T23:28:55.333Z",
+      "announced_sessions": [
+        "spec-deposit-1772062135326",
+        "spec-final-1772062154149"
+      ]
+    }
+  ]
+}
