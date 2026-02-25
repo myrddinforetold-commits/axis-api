@@ -5,8 +5,10 @@
   "main": "dist/index.js",
   "scripts": {
     "dev": "tsx watch src/index.ts",
+    "dev:worker:cal-treasury": "tsx watch src/workers/cal_treasury_watcher.ts",
     "build": "tsc",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "worker:cal-treasury": "node dist/workers/cal_treasury_watcher.js"
   },
   "dependencies": {
     "express": "^4.18.2",
