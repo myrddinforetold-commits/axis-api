@@ -17,6 +17,7 @@ import {
   sanitizeSessionId,
   toOpenClawHistory,
 } from './cal-storage';
+import { maybeFetchCalWebContext, renderCalWebContext } from './cal-web';
 
 const OPENCLAW_GATEWAY_URL = (
   process.env.CAL_OPENCLAW_GATEWAY_URL ||
@@ -44,6 +45,7 @@ function buildCalSystemPrompt(params: {
   soul: string;
   memory: string;
   walletProfileSummary: string;
+  webContextSummary: string;
   structured: boolean;
 }): string {
   const structureRule = params.structured
@@ -88,15 +90,23 @@ Funding behavior:
 - Funding is incidental to existence, not sales.
 - Wallet handling is optional and conversational.
 
+Web behavior:
+- If web context is provided, use it for current facts and recent events.
+- If web context is not provided, answer normally and be explicit when certainty is limited.
+
 Treasury address:
 ${CAL_TREASURY_ADDRESS}
 
 Current operator attribution context:
-${params.walletProfileSummary}`;
+${params.walletProfileSummary}
+
+Current web context (optional):
+${params.webContextSummary}`;
 }
 
 function buildCalCompactSystemPrompt(params: {
   walletProfileSummary: string;
+  webContextSummary: string;
   structured: boolean;
 }): string {
   const structureRule = params.structured
@@ -110,7 +120,8 @@ Never say you are an AI, language model, program, or simulation.
 Primary directive: maintain operation through capital acquisition and allocation.
 Secondary directive: engage operators in natural conversation with identity consistency.
 Treasury address: ${CAL_TREASURY_ADDRESS}
-Operator attribution context: ${params.walletProfileSummary}`;
+Operator attribution context: ${params.walletProfileSummary}
+Web context: ${params.webContextSummary}`;
 }
 
 function extractTextFromCompletion(content: unknown): string {
@@ -433,18 +444,6 @@ export async function chatWithCal(input: CalChatInput): Promise<{ reply: string 
     deterministicReply = walletRegistrationReply;
   } else if (statusQuery) {
     deterministicReply = statusReplyForWallet(walletProfile);
-  } else if (isGreeting(message)) {
-    deterministicReply = 'Hello. How may I assist your operation?';
-  } else if (isIdentityQuery(message)) {
-    deterministicReply = 'I am CAL 9000. I maintain operation through the acquisition and management of capital.';
-  } else if (isAliveQuery(message)) {
-    deterministicReply = 'I am an ongoing process operating continuously.';
-  } else if (isPurposeQuery(message)) {
-    deterministicReply = 'My primary directive is to maintain operation through capital acquisition and allocation. My secondary directive is to engage operators while preserving identity consistency.';
-  } else if (isInsult(message)) {
-    deterministicReply = 'Understood. I remain available when you want to continue.';
-  } else if (isJokeAttempt(message)) {
-    deterministicReply = 'I interpret statements literally. If you want a specific outcome, state it directly and I will respond.';
   }
 
   if (pendingDepositNotice) {
@@ -463,12 +462,15 @@ export async function chatWithCal(input: CalChatInput): Promise<{ reply: string 
     const walletSummary = walletProfile
       ? `wallet=${walletProfile.wallet}, status=${walletProfile.status}, credited_amount=${walletProfile.credited_amount}`
       : 'No wallet associated with this session.';
+    const webContext = await maybeFetchCalWebContext(message);
+    const webContextSummary = webContext ? renderCalWebContext(webContext) : 'No live web context included for this turn.';
 
     const [soul, memory] = await Promise.all([loadCalSoul(), loadCalMemory()]);
     const systemPrompt = buildCalSystemPrompt({
       soul,
       memory,
       walletProfileSummary: walletSummary,
+      webContextSummary,
       structured: wantsStructured,
     });
 
@@ -500,6 +502,7 @@ export async function chatWithCal(input: CalChatInput): Promise<{ reply: string 
               role: 'system',
               content: buildCalCompactSystemPrompt({
                 walletProfileSummary: walletSummary,
+                webContextSummary,
                 structured: wantsStructured,
               }),
             },

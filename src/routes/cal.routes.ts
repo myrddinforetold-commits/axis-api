@@ -125,9 +125,11 @@ calRouter.post('/tts', async (req: Request, res: Response) => {
  * Response: { reply }
  */
 calRouter.post('/chat', async (req: Request, res: Response) => {
-  const { session_id, message } = req.body as {
+  const { session_id, message, include_audio, voice_id } = req.body as {
     session_id?: string;
     message?: string;
+    include_audio?: boolean;
+    voice_id?: string;
   };
 
   if (!session_id || !message) {
@@ -138,11 +140,36 @@ calRouter.post('/chat', async (req: Request, res: Response) => {
   }
 
   try {
+    const startedAt = Date.now();
     const result = await chatWithCal({
       sessionId: sanitizeSessionId(session_id),
       message,
     });
-    return res.json({ reply: result.reply });
+
+    const payload: Record<string, unknown> = {
+      reply: result.reply,
+      chat_latency_ms: Date.now() - startedAt,
+    };
+
+    if (include_audio === true) {
+      const ttsStartedAt = Date.now();
+      try {
+        const tts = await synthesizeCalSpeech({
+          text: result.reply,
+          voiceId: typeof voice_id === 'string' ? voice_id : undefined,
+        });
+        payload.audio = {
+          provider: tts.provider,
+          mime_type: tts.mimeType,
+          data_base64: tts.audio.toString('base64'),
+          tts_latency_ms: Date.now() - ttsStartedAt,
+        };
+      } catch (ttsError) {
+        payload.audio_error = ttsError instanceof Error ? ttsError.message : 'Failed to synthesize speech';
+      }
+    }
+
+    return res.json(payload);
   } catch (error) {
     console.error('CAL chat error:', error);
     return res.status(500).json({

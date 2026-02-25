@@ -1,12 +1,17 @@
 const ELEVENLABS_API_KEY = process.env.CAL_ELEVENLABS_API_KEY || process.env.ELEVENLABS_API_KEY || '';
 const ELEVENLABS_BASE_URL = (process.env.CAL_ELEVENLABS_BASE_URL || 'https://api.elevenlabs.io').replace(/\/+$/, '');
 const ELEVENLABS_VOICE_ID = process.env.CAL_ELEVENLABS_VOICE_ID || process.env.ELEVENLABS_VOICE_ID || 'EXAVITQu4vr4xnSDxMaL';
-const ELEVENLABS_MODEL_ID = process.env.CAL_ELEVENLABS_MODEL_ID || 'eleven_multilingual_v2';
-const ELEVENLABS_OUTPUT_FORMAT = process.env.CAL_ELEVENLABS_OUTPUT_FORMAT || 'mp3_44100_128';
+const ELEVENLABS_MODEL_ID = process.env.CAL_ELEVENLABS_MODEL_ID || 'eleven_turbo_v2_5';
+const ELEVENLABS_OUTPUT_FORMAT = process.env.CAL_ELEVENLABS_OUTPUT_FORMAT || 'mp3_22050_32';
+const ELEVENLABS_STREAMING_LATENCY = Math.max(
+  0,
+  Math.min(4, Number(process.env.CAL_ELEVENLABS_STREAMING_LATENCY || 4)),
+);
 
 const OPENAI_API_KEY = process.env.CAL_OPENAI_API_KEY || process.env.OPENAI_API_KEY || '';
 const OPENAI_TTS_MODEL = process.env.CAL_OPENAI_TTS_MODEL || 'gpt-4o-mini-tts';
 const OPENAI_TTS_VOICE = process.env.CAL_OPENAI_TTS_VOICE || 'alloy';
+const CAL_TTS_TIMEOUT_MS = Math.max(2000, Number(process.env.CAL_TTS_TIMEOUT_MS || 7000));
 
 export interface CalTtsResult {
   provider: 'elevenlabs' | 'openai';
@@ -26,13 +31,26 @@ function ensureAudioResponse(response: Response, body: ArrayBuffer): Buffer {
   return Buffer.from(body);
 }
 
+async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, {
+      ...init,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function tryElevenLabs(text: string, voiceId?: string): Promise<CalTtsResult> {
   if (!ELEVENLABS_API_KEY) {
     throw new Error('ELEVENLABS_API_KEY missing');
   }
 
   const targetVoiceId = (voiceId || ELEVENLABS_VOICE_ID).trim();
-  const response = await fetch(`${ELEVENLABS_BASE_URL}/v1/text-to-speech/${encodeURIComponent(targetVoiceId)}`, {
+  const response = await fetchWithTimeout(`${ELEVENLABS_BASE_URL}/v1/text-to-speech/${encodeURIComponent(targetVoiceId)}`, {
     method: 'POST',
     headers: {
       'xi-api-key': ELEVENLABS_API_KEY,
@@ -43,9 +61,9 @@ async function tryElevenLabs(text: string, voiceId?: string): Promise<CalTtsResu
       text,
       model_id: ELEVENLABS_MODEL_ID,
       output_format: ELEVENLABS_OUTPUT_FORMAT,
-      optimize_streaming_latency: 2,
+      optimize_streaming_latency: ELEVENLABS_STREAMING_LATENCY,
     }),
-  });
+  }, CAL_TTS_TIMEOUT_MS);
 
   if (!response.ok) {
     const details = (await response.text()).slice(0, 400);
@@ -65,7 +83,7 @@ async function tryOpenAi(text: string): Promise<CalTtsResult> {
     throw new Error('OPENAI_API_KEY missing');
   }
 
-  const response = await fetch('https://api.openai.com/v1/audio/speech', {
+  const response = await fetchWithTimeout('https://api.openai.com/v1/audio/speech', {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${OPENAI_API_KEY}`,
@@ -78,7 +96,7 @@ async function tryOpenAi(text: string): Promise<CalTtsResult> {
       input: text,
       response_format: 'mp3',
     }),
-  });
+  }, CAL_TTS_TIMEOUT_MS);
 
   if (!response.ok) {
     const details = (await response.text()).slice(0, 400);
