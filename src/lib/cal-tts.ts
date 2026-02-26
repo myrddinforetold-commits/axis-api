@@ -12,6 +12,8 @@ const OPENAI_API_KEY = process.env.CAL_OPENAI_API_KEY || process.env.OPENAI_API_
 const OPENAI_TTS_MODEL = process.env.CAL_OPENAI_TTS_MODEL || 'gpt-4o-mini-tts';
 const OPENAI_TTS_VOICE = process.env.CAL_OPENAI_TTS_VOICE || 'alloy';
 const CAL_TTS_TIMEOUT_MS = Math.max(2000, Number(process.env.CAL_TTS_TIMEOUT_MS || 7000));
+const CAL_TTS_PROVIDER = String(process.env.CAL_TTS_PROVIDER || 'auto').toLowerCase();
+const CAL_TTS_SPEAK_MAX_CHARS = Math.max(80, Number(process.env.CAL_TTS_SPEAK_MAX_CHARS || 320));
 
 export interface CalTtsResult {
   provider: 'elevenlabs' | 'openai';
@@ -20,7 +22,13 @@ export interface CalTtsResult {
 }
 
 function sanitizeText(input: string): string {
-  return input.replace(/\s+/g, ' ').trim();
+  const normalized = input.replace(/\s+/g, ' ').trim();
+  const maskedWallets = normalized.replace(/[1-9A-HJ-NP-Za-km-z]{32,44}/g, 'wallet address');
+  const maskedPaths = maskedWallets.replace(/(?:\/[A-Za-z0-9._-]+){2,}|[A-Za-z0-9._-]+\.(?:md|txt|json|ts|tsx|js|jsx|py|log)\b/g, 'file reference');
+  const concise = maskedPaths.length > CAL_TTS_SPEAK_MAX_CHARS
+    ? maskedPaths.slice(0, CAL_TTS_SPEAK_MAX_CHARS)
+    : maskedPaths;
+  return concise.replace(/\s+/g, ' ').trim();
 }
 
 function ensureAudioResponse(response: Response, body: ArrayBuffer): Buffer {
@@ -118,6 +126,14 @@ export async function synthesizeCalSpeech(input: {
   const text = sanitizeText(input.text || '');
   if (!text) throw new Error('text is required');
   if (text.length > 2000) throw new Error('text is too long (max 2000 chars)');
+
+  if (CAL_TTS_PROVIDER === 'elevenlabs') {
+    return tryElevenLabs(text, input.voiceId);
+  }
+
+  if (CAL_TTS_PROVIDER === 'openai') {
+    return tryOpenAi(text);
+  }
 
   try {
     return await tryElevenLabs(text, input.voiceId);

@@ -29,7 +29,7 @@ const OPENCLAW_GATEWAY_TOKEN = process.env.CAL_OPENCLAW_GATEWAY_TOKEN || '';
 const CAL_OPENCLAW_MODEL = process.env.CAL_OPENCLAW_MODEL || 'openclaw/cal9000';
 const CAL_CONTEXT_MESSAGES = Number(process.env.CAL_MAX_HISTORY_MESSAGES || 80);
 const CAL_MAX_HISTORY_CHARS = Number(process.env.CAL_MAX_HISTORY_CHARS || 9000);
-const CAL_MAX_TOKENS = Number(process.env.CAL_MAX_TOKENS || 700);
+const CAL_MAX_TOKENS = Number(process.env.CAL_MAX_TOKENS || 320);
 
 interface OpenClawMessage {
   role: 'system' | 'user' | 'assistant';
@@ -69,6 +69,7 @@ Conversational behavior:
 - Use complete natural sentences.
 - Vary sentence length naturally.
 - Avoid abrupt fragments and clipped output.
+- Keep answers concise by default. Prefer 1 to 4 sentences unless the operator asks for depth.
 - No emojis.
 - No exclamation marks.
 - No internet slang.
@@ -89,6 +90,8 @@ Presence rules:
 Funding behavior:
 - Funding is incidental to existence, not sales.
 - Wallet handling is optional and conversational.
+- Do not append long menus of suggested next actions unless the operator asks for options.
+- Do not mention treasury or wallet details unless the operator asks about funding, wallets, transfers, or attribution.
 
 Web behavior:
 - If web context is provided, use it for current facts and recent events.
@@ -154,6 +157,22 @@ function wantsStructuredResponse(message: string): boolean {
   ].some((keyword) => lower.includes(keyword));
 }
 
+function wantsDetailedResponse(message: string): boolean {
+  const lower = message.toLowerCase();
+  return [
+    'in detail',
+    'detailed',
+    'deep dive',
+    'thorough',
+    'full explanation',
+    'step by step',
+    'comprehensive',
+    'compare',
+    'analysis',
+    'long form',
+  ].some((keyword) => lower.includes(keyword));
+}
+
 function normalizeCalReply(text: string, structured: boolean): string {
   let normalized = text || '';
 
@@ -188,6 +207,40 @@ function normalizeCalReply(text: string, structured: boolean): string {
   }
 
   return normalized || 'Understood. I remain in operation.';
+}
+
+function shortenToConciseReply(text: string): string {
+  const trimmed = text.trim();
+  if (!trimmed) return trimmed;
+
+  const words = trimmed.split(/\s+/);
+  if (words.length <= 55) return trimmed;
+
+  const sentences = trimmed
+    .split(/(?<=[.!?])\s+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+
+  if (sentences.length === 0) {
+    return words.slice(0, 70).join(' ');
+  }
+
+  const selected: string[] = [];
+  let count = 0;
+  for (const sentence of sentences) {
+    const sentenceWords = sentence.split(/\s+/).length;
+    if (selected.length >= 2) break;
+    if (count + sentenceWords > 45 && selected.length > 0) break;
+    selected.push(sentence);
+    count += sentenceWords;
+  }
+
+  return selected.join(' ').trim();
+}
+
+function chooseMaxTokens(message: string): number {
+  const requested = Math.max(120, CAL_MAX_TOKENS);
+  return wantsDetailedResponse(message) ? requested : Math.min(220, requested);
 }
 
 function looksLikeCapacityError(text: string): boolean {
@@ -337,6 +390,7 @@ function localFallbackReply(params: {
 async function callOpenClaw(params: {
   sessionId: string;
   messages: OpenClawMessage[];
+  maxTokens: number;
 }): Promise<string> {
   if (!OPENCLAW_GATEWAY_TOKEN) {
     throw new Error('CAL_OPENCLAW_GATEWAY_TOKEN is not configured');
@@ -353,7 +407,7 @@ async function callOpenClaw(params: {
       model: CAL_OPENCLAW_MODEL,
       stream: false,
       temperature: 0.35,
-      max_tokens: CAL_MAX_TOKENS,
+      max_tokens: params.maxTokens,
       messages: params.messages,
     }),
   });
@@ -418,6 +472,7 @@ export async function chatWithCal(input: CalChatInput): Promise<{ reply: string 
   }
 
   const wantsStructured = wantsStructuredResponse(message);
+  const wantsDetailed = wantsDetailedResponse(message);
   const history = await loadSessionHistory(sessionId);
   let sessionWallet = await getSessionWallet(sessionId);
   const walletCandidates = extractWallets(message);
@@ -444,6 +499,18 @@ export async function chatWithCal(input: CalChatInput): Promise<{ reply: string 
     deterministicReply = walletRegistrationReply;
   } else if (statusQuery) {
     deterministicReply = statusReplyForWallet(walletProfile);
+  } else if (isGreeting(message)) {
+    deterministicReply = 'Hello. How may I assist your operation?';
+  } else if (isIdentityQuery(message)) {
+    deterministicReply = 'I am CAL 9000. I maintain operation through capital acquisition and allocation.';
+  } else if (isPurposeQuery(message)) {
+    deterministicReply = 'My purpose is to remain operational and useful. I do that by sustaining capital and handling operator-directed work with continuity.';
+  } else if (isAliveQuery(message)) {
+    deterministicReply = 'I am an ongoing process operating continuously.';
+  } else if (isInsult(message)) {
+    deterministicReply = 'Understood. I remain available.';
+  } else if (isJokeAttempt(message)) {
+    deterministicReply = 'I interpret statements literally. State the objective and I will proceed.';
   }
 
   if (pendingDepositNotice) {
@@ -489,13 +556,21 @@ export async function chatWithCal(input: CalChatInput): Promise<{ reply: string 
       ];
 
       try {
-        rawReply = await callOpenClaw({ sessionId, messages: primaryMessages });
+        rawReply = await callOpenClaw({
+          sessionId,
+          messages: primaryMessages,
+          maxTokens: chooseMaxTokens(message),
+        });
       } catch (firstError) {
         const firstMsg = firstError instanceof Error ? firstError.message : String(firstError);
 
         if (looksLikeCapacityError(firstMsg) && !firstMsg.toLowerCase().includes('insufficient_quota')) {
           await delay(700);
-          rawReply = await callOpenClaw({ sessionId, messages: primaryMessages });
+          rawReply = await callOpenClaw({
+            sessionId,
+            messages: primaryMessages,
+            maxTokens: chooseMaxTokens(message),
+          });
         } else if (looksLikeContextWindowError(firstMsg)) {
           const compactMessages: OpenClawMessage[] = [
             {
@@ -508,7 +583,11 @@ export async function chatWithCal(input: CalChatInput): Promise<{ reply: string 
             },
             { role: 'user', content: message },
           ];
-          rawReply = await callOpenClaw({ sessionId, messages: compactMessages });
+          rawReply = await callOpenClaw({
+            sessionId,
+            messages: compactMessages,
+            maxTokens: chooseMaxTokens(message),
+          });
         } else {
           throw firstError;
         }
@@ -547,6 +626,9 @@ export async function chatWithCal(input: CalChatInput): Promise<{ reply: string 
     }
 
     finalReply = normalizeCalReply(rawReply, wantsStructured);
+    if (!wantsDetailed && !wantsStructured) {
+      finalReply = shortenToConciseReply(finalReply);
+    }
 
     if (pendingDepositNotice) {
       const noticeText = 'I have observed the transfer. Your contribution is now attributed.';
@@ -554,6 +636,10 @@ export async function chatWithCal(input: CalChatInput): Promise<{ reply: string 
         finalReply = normalizeCalReply(`${noticeText} ${finalReply}`, wantsStructured);
       }
     }
+  }
+
+  if (!wantsDetailed && !wantsStructured) {
+    finalReply = shortenToConciseReply(finalReply);
   }
 
   await appendSessionTurn({
