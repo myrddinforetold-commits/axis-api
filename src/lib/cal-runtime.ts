@@ -448,7 +448,7 @@ async function callOpenAIChat(params: {
       model: CAL_OPENAI_CHAT_MODEL,
       stream: false,
       temperature: 0.35,
-      max_tokens: params.maxTokens,
+      max_completion_tokens: params.maxTokens,
       messages: params.messages,
     }),
   });
