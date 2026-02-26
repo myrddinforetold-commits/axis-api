@@ -20,7 +20,7 @@ import {
 export const calRouter = Router();
 const OPENAI_API_KEY = process.env.CAL_OPENAI_API_KEY || process.env.OPENAI_API_KEY || '';
 const CAL_OPENAI_REALTIME_MODEL = process.env.CAL_OPENAI_REALTIME_MODEL || 'gpt-4o-realtime-preview';
-const CAL_OPENAI_REALTIME_VOICE = process.env.CAL_OPENAI_REALTIME_VOICE || 'alloy';
+const CAL_OPENAI_REALTIME_VOICE = process.env.CAL_OPENAI_REALTIME_VOICE || 'ash';
 const CAL_OPENAI_REALTIME_TEMPERATURE = Number(process.env.CAL_OPENAI_REALTIME_TEMPERATURE || 0.6);
 const CAL_OPENAI_REALTIME_MAX_OUTPUT_TOKENS = Math.max(
   120,

@@ -384,7 +384,7 @@ function localFallbackReply(params: {
     return 'I interpret statements literally. If you want a specific outcome, state it directly and I will respond.';
   }
 
-  return 'I see. I remain in operation and I am listening.';
+  return 'Understood. I am CAL 9000. State the objective and constraints, and I will respond directly.';
 }
 
 async function callOpenClaw(params: {
