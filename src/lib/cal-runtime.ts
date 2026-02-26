@@ -447,7 +447,6 @@ async function callOpenAIChat(params: {
     body: JSON.stringify({
       model: CAL_OPENAI_CHAT_MODEL,
       stream: false,
-      temperature: 0.35,
       max_completion_tokens: params.maxTokens,
       messages: params.messages,
     }),
