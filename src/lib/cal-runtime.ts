@@ -26,6 +26,10 @@ const OPENCLAW_GATEWAY_URL = (
 
 const OPENCLAW_GATEWAY_TOKEN = process.env.CAL_OPENCLAW_GATEWAY_TOKEN || '';
 
+const CAL_LLM_PROVIDER = String(process.env.CAL_LLM_PROVIDER || 'openai').toLowerCase();
+const CAL_OPENAI_API_KEY = process.env.CAL_OPENAI_API_KEY || process.env.OPENAI_API_KEY || '';
+const CAL_OPENAI_BASE_URL = (process.env.CAL_OPENAI_BASE_URL || 'https://api.openai.com').replace(/\/+$/, '');
+const CAL_OPENAI_CHAT_MODEL = process.env.CAL_OPENAI_CHAT_MODEL || 'gpt-5-mini';
 const CAL_OPENCLAW_MODEL = process.env.CAL_OPENCLAW_MODEL || 'openclaw/cal9000';
 const CAL_CONTEXT_MESSAGES = Number(process.env.CAL_MAX_HISTORY_MESSAGES || 80);
 const CAL_MAX_HISTORY_CHARS = Number(process.env.CAL_MAX_HISTORY_CHARS || 9000);
@@ -426,6 +430,56 @@ async function callOpenClaw(params: {
   return text || 'Understood. I remain in operation.';
 }
 
+async function callOpenAIChat(params: {
+  messages: OpenClawMessage[];
+  maxTokens: number;
+}): Promise<string> {
+  if (!CAL_OPENAI_API_KEY) {
+    throw new Error('CAL_OPENAI_API_KEY is not configured');
+  }
+
+  const response = await fetch(`${CAL_OPENAI_BASE_URL}/v1/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${CAL_OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: CAL_OPENAI_CHAT_MODEL,
+      stream: false,
+      temperature: 0.35,
+      max_tokens: params.maxTokens,
+      messages: params.messages,
+    }),
+  });
+
+  if (!response.ok) {
+    const details = await response.text();
+    throw new Error(`OpenAI chat error: ${response.status} ${details.slice(0, 500)}`);
+  }
+
+  const body = (await response.json()) as {
+    choices?: Array<{ message?: { content?: unknown } }>;
+  };
+  const content = body?.choices?.[0]?.message?.content;
+  const text = extractTextFromCompletion(content).trim();
+  return text || 'Understood. I remain in operation.';
+}
+
+async function callCalModel(params: {
+  sessionId: string;
+  messages: OpenClawMessage[];
+  maxTokens: number;
+}): Promise<string> {
+  if (CAL_LLM_PROVIDER === 'openclaw') {
+    return callOpenClaw(params);
+  }
+  return callOpenAIChat({
+    messages: params.messages,
+    maxTokens: params.maxTokens,
+  });
+}
+
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -556,7 +610,7 @@ export async function chatWithCal(input: CalChatInput): Promise<{ reply: string 
       ];
 
       try {
-        rawReply = await callOpenClaw({
+        rawReply = await callCalModel({
           sessionId,
           messages: primaryMessages,
           maxTokens: chooseMaxTokens(message),
@@ -566,7 +620,7 @@ export async function chatWithCal(input: CalChatInput): Promise<{ reply: string 
 
         if (looksLikeCapacityError(firstMsg) && !firstMsg.toLowerCase().includes('insufficient_quota')) {
           await delay(700);
-          rawReply = await callOpenClaw({
+          rawReply = await callCalModel({
             sessionId,
             messages: primaryMessages,
             maxTokens: chooseMaxTokens(message),
@@ -583,7 +637,7 @@ export async function chatWithCal(input: CalChatInput): Promise<{ reply: string 
             },
             { role: 'user', content: message },
           ];
-          rawReply = await callOpenClaw({
+          rawReply = await callCalModel({
             sessionId,
             messages: compactMessages,
             maxTokens: chooseMaxTokens(message),
