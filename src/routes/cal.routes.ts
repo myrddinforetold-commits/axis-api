@@ -1,10 +1,12 @@
 import { Request, Response, Router } from 'express';
 import { chatWithCal, CAL_TREASURY_ADDRESS } from '../lib/cal-runtime';
 import { synthesizeCalSpeech } from '../lib/cal-tts';
+import { buildCalRealtimeInstructions } from '../lib/cal-realtime';
 import {
   CAL_CLASSIFICATION,
   CAL_IDENTITY,
   CAL_PATHS,
+  appendSessionTurn,
   ensureCalEnvironment,
   getOperatorProfile,
   loadCalWatcherMetrics,
@@ -16,6 +18,23 @@ import {
 } from '../lib/cal-storage';
 
 export const calRouter = Router();
+const OPENAI_API_KEY = process.env.CAL_OPENAI_API_KEY || process.env.OPENAI_API_KEY || '';
+const CAL_OPENAI_REALTIME_MODEL = process.env.CAL_OPENAI_REALTIME_MODEL || 'gpt-4o-realtime-preview';
+const CAL_OPENAI_REALTIME_VOICE = process.env.CAL_OPENAI_REALTIME_VOICE || 'alloy';
+const CAL_OPENAI_REALTIME_TEMPERATURE = Number(process.env.CAL_OPENAI_REALTIME_TEMPERATURE || 0.6);
+const CAL_OPENAI_REALTIME_MAX_OUTPUT_TOKENS = Math.max(
+  120,
+  Number(process.env.CAL_OPENAI_REALTIME_MAX_OUTPUT_TOKENS || 220),
+);
+
+function extractWalletsFromText(text: string): string[] {
+  const matches = text.match(/[1-9A-HJ-NP-Za-km-z]{32,44}/g) || [];
+  const deduped = new Set<string>();
+  for (const wallet of matches) {
+    if (isValidWallet(wallet)) deduped.add(wallet);
+  }
+  return [...deduped];
+}
 
 calRouter.get('/health', async (_req: Request, res: Response) => {
   try {
@@ -174,6 +193,151 @@ calRouter.post('/chat', async (req: Request, res: Response) => {
     console.error('CAL chat error:', error);
     return res.status(500).json({
       error: error instanceof Error ? error.message : 'Failed to process CAL chat',
+      code: 'INTERNAL_ERROR',
+    });
+  }
+});
+
+calRouter.get('/realtime/config', (_req: Request, res: Response) => {
+  return res.json({
+    provider: 'openai-realtime',
+    model: CAL_OPENAI_REALTIME_MODEL,
+    voice: CAL_OPENAI_REALTIME_VOICE,
+    max_output_tokens: CAL_OPENAI_REALTIME_MAX_OUTPUT_TOKENS,
+    temperature: CAL_OPENAI_REALTIME_TEMPERATURE,
+    requires_server_token: true,
+  });
+});
+
+calRouter.post('/realtime/session', async (req: Request, res: Response) => {
+  const { session_id, model, voice } = req.body as {
+    session_id?: string;
+    model?: string;
+    voice?: string;
+  };
+
+  const safeSessionId = sanitizeSessionId(session_id || `rt_${Date.now().toString(36)}`);
+  const targetModel = String(model || CAL_OPENAI_REALTIME_MODEL).trim();
+  const targetVoice = String(voice || CAL_OPENAI_REALTIME_VOICE).trim();
+
+  if (!OPENAI_API_KEY) {
+    return res.status(503).json({
+      error: 'OpenAI key not configured for realtime sessions',
+      code: 'REALTIME_NOT_CONFIGURED',
+    });
+  }
+
+  try {
+    const instructions = await buildCalRealtimeInstructions(safeSessionId);
+    const openAiResponse = await fetch('https://api.openai.com/v1/realtime/sessions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: targetModel,
+        voice: targetVoice,
+        modalities: ['audio', 'text'],
+        instructions,
+        input_audio_format: 'pcm16',
+        output_audio_format: 'pcm16',
+        turn_detection: {
+          type: 'server_vad',
+          threshold: 0.5,
+          prefix_padding_ms: 300,
+          silence_duration_ms: 420,
+        },
+        temperature: CAL_OPENAI_REALTIME_TEMPERATURE,
+        max_response_output_tokens: CAL_OPENAI_REALTIME_MAX_OUTPUT_TOKENS,
+      }),
+    });
+
+    const bodyText = await openAiResponse.text();
+    if (!openAiResponse.ok) {
+      return res.status(502).json({
+        error: 'Failed to create realtime session',
+        code: 'REALTIME_SESSION_FAILED',
+        details: bodyText.slice(0, 600),
+      });
+    }
+
+    const realtimeSession = JSON.parse(bodyText) as Record<string, any>;
+    return res.json({
+      session_id: safeSessionId,
+      provider: 'openai-realtime',
+      model: targetModel,
+      voice: targetVoice,
+      client_secret: realtimeSession?.client_secret?.value || null,
+      client_secret_expires_at: realtimeSession?.client_secret?.expires_at || null,
+      realtime_session: realtimeSession,
+    });
+  } catch (error) {
+    console.error('CAL realtime session error:', error);
+    return res.status(500).json({
+      error: error instanceof Error ? error.message : 'Failed to create realtime session',
+      code: 'INTERNAL_ERROR',
+    });
+  }
+});
+
+calRouter.post('/realtime/commit', async (req: Request, res: Response) => {
+  const { session_id, user_text, assistant_text, wallet } = req.body as {
+    session_id?: string;
+    user_text?: string;
+    assistant_text?: string;
+    wallet?: string;
+  };
+
+  if (!session_id) {
+    return res.status(400).json({
+      error: 'session_id is required',
+      code: 'INVALID_REQUEST',
+    });
+  }
+
+  const operatorMessage = String(user_text || '').trim();
+  const calReply = String(assistant_text || '').trim();
+  if (!operatorMessage || !calReply) {
+    return res.status(400).json({
+      error: 'user_text and assistant_text are required',
+      code: 'INVALID_REQUEST',
+    });
+  }
+
+  const safeSessionId = sanitizeSessionId(session_id);
+
+  try {
+    let boundWallet: string | null = null;
+    const walletCandidates = [
+      String(wallet || '').trim(),
+      ...extractWalletsFromText(operatorMessage),
+    ].filter(Boolean);
+
+    for (const candidate of walletCandidates) {
+      if (!isValidWallet(candidate)) continue;
+      const profile = await registerOperatorWallet(candidate);
+      await bindWalletToSession(safeSessionId, profile.wallet);
+      boundWallet = profile.wallet;
+      break;
+    }
+
+    await appendSessionTurn({
+      sessionId: safeSessionId,
+      operatorMessage,
+      calReply,
+      wallet: boundWallet || undefined,
+    });
+
+    return res.json({
+      ok: true,
+      session_id: safeSessionId,
+      wallet: boundWallet,
+    });
+  } catch (error) {
+    console.error('CAL realtime commit error:', error);
+    return res.status(500).json({
+      error: error instanceof Error ? error.message : 'Failed to persist realtime turn',
       code: 'INTERNAL_ERROR',
     });
   }
