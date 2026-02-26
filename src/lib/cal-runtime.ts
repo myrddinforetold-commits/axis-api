@@ -30,6 +30,8 @@ const CAL_LLM_PROVIDER = String(process.env.CAL_LLM_PROVIDER || 'openai').toLowe
 const CAL_OPENAI_API_KEY = process.env.CAL_OPENAI_API_KEY || process.env.OPENAI_API_KEY || '';
 const CAL_OPENAI_BASE_URL = (process.env.CAL_OPENAI_BASE_URL || 'https://api.openai.com').replace(/\/+$/, '');
 const CAL_OPENAI_CHAT_MODEL = process.env.CAL_OPENAI_CHAT_MODEL || 'gpt-5-mini';
+const CAL_OPENAI_REASONING_EFFORT = process.env.CAL_OPENAI_REASONING_EFFORT || 'minimal';
+const CAL_OPENAI_TEXT_VERBOSITY = process.env.CAL_OPENAI_TEXT_VERBOSITY || 'low';
 const CAL_OPENCLAW_MODEL = process.env.CAL_OPENCLAW_MODEL || 'openclaw/cal9000';
 const CAL_CONTEXT_MESSAGES = Number(process.env.CAL_MAX_HISTORY_MESSAGES || 80);
 const CAL_MAX_HISTORY_CHARS = Number(process.env.CAL_MAX_HISTORY_CHARS || 9000);
@@ -438,7 +440,7 @@ async function callOpenAIChat(params: {
     throw new Error('CAL_OPENAI_API_KEY is not configured');
   }
 
-  const response = await fetch(`${CAL_OPENAI_BASE_URL}/v1/chat/completions`, {
+  const response = await fetch(`${CAL_OPENAI_BASE_URL}/v1/responses`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -446,22 +448,49 @@ async function callOpenAIChat(params: {
     },
     body: JSON.stringify({
       model: CAL_OPENAI_CHAT_MODEL,
-      stream: false,
-      max_completion_tokens: params.maxTokens,
-      messages: params.messages,
+      max_output_tokens: params.maxTokens,
+      reasoning: { effort: CAL_OPENAI_REASONING_EFFORT },
+      text: { verbosity: CAL_OPENAI_TEXT_VERBOSITY },
+      input: params.messages.map((msg) => ({
+        role: msg.role,
+        content: [{ type: 'input_text', text: msg.content }],
+      })),
     }),
   });
 
   if (!response.ok) {
     const details = await response.text();
-    throw new Error(`OpenAI chat error: ${response.status} ${details.slice(0, 500)}`);
+    throw new Error(`OpenAI responses error: ${response.status} ${details.slice(0, 500)}`);
   }
 
   const body = (await response.json()) as {
-    choices?: Array<{ message?: { content?: unknown } }>;
+    output_text?: string | null;
+    status?: string;
+    incomplete_details?: { reason?: string };
+    output?: Array<{
+      type?: string;
+      content?: Array<{ type?: string; text?: string }>;
+    }>;
   };
-  const content = body?.choices?.[0]?.message?.content;
-  const text = extractTextFromCompletion(content).trim();
+
+  let text = typeof body.output_text === 'string' ? body.output_text.trim() : '';
+  if (!text && Array.isArray(body.output)) {
+    const parts: string[] = [];
+    for (const item of body.output) {
+      if (!item || item.type !== 'message' || !Array.isArray(item.content)) continue;
+      for (const part of item.content) {
+        if (part?.type === 'output_text' && typeof part.text === 'string' && part.text.trim()) {
+          parts.push(part.text.trim());
+        }
+      }
+    }
+    text = parts.join('\n').trim();
+  }
+
+  if (!text && body.status === 'incomplete') {
+    throw new Error(`OpenAI responses incomplete: ${body.incomplete_details?.reason || 'unknown_reason'}`);
+  }
+
   return text || 'Understood. I remain in operation.';
 }
 
